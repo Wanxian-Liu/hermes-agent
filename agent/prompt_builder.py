@@ -147,6 +147,11 @@ HERMES_AGENT_HELP_GUIDANCE = (
     "before answering. Docs: https://hermes-agent.nousresearch.com/docs"
 )
 
+PARALYSIS_BREAK_CONSTRAINT = (
+    "同一问题想3轮仍未行动 → 停下来，选最小一步，执行它。70%信息＋行动 ＞ 100%信息＋等待。"
+)
+)
+
 MEMORY_GUIDANCE = (
     "You have persistent memory across sessions. Save durable facts using the memory "
     "tool: user preferences, environment details, tool quirks, and stable conventions. "
