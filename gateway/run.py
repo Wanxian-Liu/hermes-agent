@@ -166,9 +166,42 @@ def _gateway_provider_error_reply(text: str) -> str:
     )
 
 
+_GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
+    r"^\s*(\W*\s*)?("
+    r"api\s+(?:call\s+)?failed"
+    r"|provider\s+authentication\s+failed"
+    r"|non-retryable\s+error"
+    r"|rate\s+limited\s+after\s+\d+\s+retries"
+    r"|error\s+code\s*:"
+    r"|http\s*\d{3}\b"
+    r"|incorrect\s+api\s+key"
+    r"|invalid\s+api\s+key"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def _looks_like_gateway_provider_error(text: str) -> bool:
-    """True when text is infrastructure/provider failure, not normal content."""
-    return bool(_GATEWAY_PROVIDER_ERROR_RE.search(text))
+    """True when text is infrastructure/provider failure, not normal content.
+
+    Two heuristics combined so the rewrite only fires on actual provider
+    error envelopes, not on assistant prose that happens to mention an
+    HTTP status code:
+
+    1. The text is short — real provider errors are 1–3 lines of envelope
+       text; assistant answers are usually longer.
+    2. AND the error marker appears at the start of the message (optionally
+       behind a punctuation/symbol prefix), not buried mid-paragraph in an
+       explanation like "HTTP 404 means 'not found' — ...".
+    """
+    if not text:
+        return False
+    body = str(text).strip()
+    # Provider failure envelopes are short. Assistant answers that happen
+    # to mention HTTP status codes ("HTTP 404 means...") tend to be longer.
+    if len(body) > 400 or body.count("\n") > 4:
+        return False
+    return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
@@ -1076,7 +1109,7 @@ def _check_unavailable_skill(command_name: str) -> str | None:
     normalized = command_name.lower().replace("_", "-")
     try:
         from tools.skills_tool import _get_disabled_skill_names
-        from agent.skill_utils import get_all_skills_dirs
+        from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
         disabled = _get_disabled_skill_names()
 
         # Check disabled skills across all dirs (local + external)
@@ -1084,7 +1117,7 @@ def _check_unavailable_skill(command_name: str) -> str | None:
             if not skills_dir.exists():
                 continue
             for skill_md in skills_dir.rglob("SKILL.md"):
-                if any(part in {'.git', '.github', '.hub', '.archive'} for part in skill_md.parts):
+                if is_excluded_skill_path(skill_md):
                     continue
                 slug, declared_name = _skill_slug_from_frontmatter(skill_md)
                 if not slug or not declared_name:
@@ -1103,6 +1136,8 @@ def _check_unavailable_skill(command_name: str) -> str | None:
         optional_dir = get_optional_skills_dir(repo_root / "optional-skills")
         if optional_dir.exists():
             for skill_md in optional_dir.rglob("SKILL.md"):
+                if is_excluded_skill_path(skill_md):
+                    continue
                 slug, _declared = _skill_slug_from_frontmatter(skill_md)
                 if not slug:
                     continue
@@ -5862,6 +5897,12 @@ class GatewayRunner:
             if platform_registry.is_registered(platform.value):
                 adapter = platform_registry.create_adapter(platform.value, config)
                 if adapter is not None:
+                    # Adapters that need a back-reference to the gateway runner
+                    # (e.g. for cross-platform admin alerts) declare a
+                    # ``gateway_runner`` attribute. Inject it after creation so
+                    # plugin adapters don't need a custom factory signature.
+                    if hasattr(adapter, "gateway_runner"):
+                        adapter.gateway_runner = self
                     return adapter
                 # Registered but failed to instantiate — don't silently fall
                 # through to built-ins (there are none for plugin platforms).
@@ -5902,15 +5943,6 @@ class GatewayRunner:
                 )
                 _notify_mode = "important"
             adapter._notifications_mode = _notify_mode
-            return adapter
-        
-        elif platform == Platform.DISCORD:
-            from gateway.platforms.discord import DiscordAdapter, check_discord_requirements
-            if not check_discord_requirements():
-                logger.warning("Discord: discord.py not installed")
-                return None
-            adapter = DiscordAdapter(config)
-            adapter.gateway_runner = self  # For cross-platform admin alerts on unauthorized slash
             return adapter
         
         elif platform == Platform.WHATSAPP:
@@ -6076,17 +6108,17 @@ class GatewayRunner:
 
         user_id = source.user_id
 
-        # Telegram (and similar) authorize entire group/forum chats by
-        # chat ID via TELEGRAM_GROUP_ALLOWED_CHATS / QQ_GROUP_ALLOWED_USERS.
+        # Telegram (and similar) authorize entire group/forum/channel chats
+        # by chat ID via TELEGRAM_GROUP_ALLOWED_CHATS / QQ_GROUP_ALLOWED_USERS.
         # That allowlist is chat-scoped, so it must work even when
-        # source.user_id is None — Telegram emits anonymous-admin posts
-        # and sender_chat traffic in groups with no `from_user`, and an
-        # operator who explicitly listed the chat expects those to be
-        # honored. Run this check before the no-user-id guard below so
+        # source.user_id is None — Telegram emits anonymous-admin posts,
+        # sender_chat traffic, and channel broadcasts with no `from_user`,
+        # and an operator who explicitly listed the chat expects those to
+        # be honored. Run this check before the no-user-id guard below so
         # documented behavior matches reality
         # (website/docs/reference/environment-variables.md,
         # website/docs/user-guide/messaging/telegram.md).
-        if source.chat_type in {"group", "forum"} and source.chat_id:
+        if source.chat_type in {"group", "forum", "channel"} and source.chat_id:
             chat_allowlist_env = {
                 Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
@@ -17485,14 +17517,31 @@ class GatewayRunner:
 
             # Wait for stream consumer to finish its final edit
             if stream_task:
-                try:
-                    await asyncio.wait_for(stream_task, timeout=5.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
+                # If the agent never created a stream consumer (e.g. non-
+                # streaming code path, or a test stub returning synchronously)
+                # there is nothing to flush — cancel immediately instead of
+                # waiting out the 5s timeout on a task that's just polling for
+                # a consumer that will never arrive.  This was a 5-second
+                # cost per non-streaming test run.
+                _has_stream_consumer = (
+                    stream_consumer_holder
+                    and stream_consumer_holder[0] is not None
+                )
+                if not _has_stream_consumer:
                     stream_task.cancel()
                     try:
                         await stream_task
                     except asyncio.CancelledError:
                         pass
+                else:
+                    try:
+                        await asyncio.wait_for(stream_task, timeout=5.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        stream_task.cancel()
+                        try:
+                            await stream_task
+                        except asyncio.CancelledError:
+                            pass
             
             # Clean up tracking
             tracking_task.cancel()
